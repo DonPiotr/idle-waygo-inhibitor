@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/rajveermalviya/go-wayland/wayland/client"
 	idle_inhibit "github.com/rajveermalviya/go-wayland/wayland/unstable/idle-inhibit-v1"
@@ -23,7 +24,7 @@ func main() {
 	}
 
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-n] <start|stop|toggle|status>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-n] <start|stop|toggle|status|check>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -35,6 +36,8 @@ func main() {
 	switch args[0] {
 	case "--daemon":
 		err = runDaemon()
+	case "check":
+		err = cmdCheck()
 	case "start":
 		err = cmdStart()
 		notifyBody = "activated"
@@ -59,6 +62,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		os.Exit(1)
 	}
+
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -140,16 +144,39 @@ func cmdStatus() error {
 	return nil
 }
 
+// runDaemon is the top-level daemon entry point. It loops, restarting the
+// Wayland session whenever the compositor closes the layer surface (e.g. on
+// monitor disconnect/reconnect), and exits cleanly on SIGTERM/SIGINT.
 func runDaemon() error {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigs)
+
+	for {
+		restart, err := runSession(sigs)
+		if err != nil {
+			return err
+		}
+		if !restart {
+			return nil
+		}
+		// Layer surface was closed by the compositor; reconnect and recreate.
+	}
+}
+
+// runSession connects to Wayland, sets up the idle inhibitor, and runs until
+// either a termination signal is received (restart=false) or the compositor
+// closes the layer surface (restart=true).
+func runSession(sigs <-chan os.Signal) (restart bool, err error) {
 	display, err := client.Connect("")
 	if err != nil {
-		return fmt.Errorf("wayland connect: %w", err)
+		return false, fmt.Errorf("wayland connect: %w", err)
 	}
 	defer display.Context().Close()
 
 	registry, err := display.GetRegistry()
 	if err != nil {
-		return fmt.Errorf("get registry: %w", err)
+		return false, fmt.Errorf("get registry: %w", err)
 	}
 
 	type globalEntry struct {
@@ -164,8 +191,248 @@ func runDaemon() error {
 	})
 
 	if err := roundtrip(display); err != nil {
+		return false, fmt.Errorf("roundtrip: %w", err)
+	}
+
+	var compositor *client.Compositor
+	var shm *client.Shm
+	var inhibitManager *idle_inhibit.IdleInhibitManager
+	var layerShell *LayerShell
+
+	for _, g := range globals {
+		switch g.iface {
+		case "wl_compositor":
+			compositor = client.NewCompositor(display.Context())
+			if err := registryBind(registry, g.name, g.iface, g.version, compositor); err != nil {
+				return false, fmt.Errorf("bind wl_compositor: %w", err)
+			}
+		case "wl_shm":
+			shm = client.NewShm(display.Context())
+			if err := registryBind(registry, g.name, g.iface, g.version, shm); err != nil {
+				return false, fmt.Errorf("bind wl_shm: %w", err)
+			}
+		case "zwp_idle_inhibit_manager_v1":
+			inhibitManager = idle_inhibit.NewIdleInhibitManager(display.Context())
+			if err := registryBind(registry, g.name, g.iface, g.version, inhibitManager); err != nil {
+				return false, fmt.Errorf("bind zwp_idle_inhibit_manager_v1: %w", err)
+			}
+		case "zwlr_layer_shell_v1":
+			layerShell = NewLayerShell(display.Context())
+			if err := registryBind(registry, g.name, g.iface, g.version, layerShell); err != nil {
+				return false, fmt.Errorf("bind zwlr_layer_shell_v1: %w", err)
+			}
+		}
+	}
+
+	if compositor == nil {
+		return false, fmt.Errorf("wl_compositor not available")
+	}
+	if shm == nil {
+		return false, fmt.Errorf("wl_shm not available")
+	}
+	if inhibitManager == nil {
+		return false, fmt.Errorf("zwp_idle_inhibit_manager_v1 not available")
+	}
+	if layerShell == nil {
+		return false, fmt.Errorf("zwlr_layer_shell_v1 not available")
+	}
+
+	// Create a 1×1 transparent pixel in shared memory.
+	// The compositor maps this fd, so we keep the file open for the session's lifetime.
+	shmFile, err := os.CreateTemp("", "idle-inhibitor-shm-*")
+	if err != nil {
+		return false, fmt.Errorf("create shm file: %w", err)
+	}
+	defer shmFile.Close()
+	if _, err := shmFile.Write(make([]byte, 4)); err != nil {
+		return false, fmt.Errorf("write shm file: %w", err)
+	}
+	pool, err := shm.CreatePool(int(shmFile.Fd()), 4)
+	if err != nil {
+		return false, fmt.Errorf("create shm pool: %w", err)
+	}
+	// stride=4 (4 bytes per row), format=ARGB8888 (0x00000000 = transparent black, premultiplied)
+	pixelBuf, err := pool.CreateBuffer(0, 1, 1, 4, uint32(client.ShmFormatArgb8888))
+	if err != nil {
+		return false, fmt.Errorf("create shm buffer: %w", err)
+	}
+
+	// Create a wl_surface and give it a layer-shell role (BACKGROUND, 1×1, no input).
+	// The compositor only honors zwp_idle_inhibitor_v1 on surfaces that are mapped
+	// (have a role + committed buffer). A bare wl_surface without a role is ignored.
+	surface, err := compositor.CreateSurface()
+	if err != nil {
+		return false, fmt.Errorf("create surface: %w", err)
+	}
+	defer surface.Destroy()
+
+	layerSurf, err := layerShell.GetLayerSurface(surface, layerOverlay, "idle-inhibitor")
+	if err != nil {
+		return false, fmt.Errorf("get layer surface: %w", err)
+	}
+	if err := layerSurf.SetSize(1, 1); err != nil {
+		return false, fmt.Errorf("set layer size: %w", err)
+	}
+	if err := layerSurf.SetKeyboardInteractivity(keyboardInteractivityNone); err != nil {
+		return false, fmt.Errorf("set keyboard interactivity: %w", err)
+	}
+
+	// When the compositor sends configure, ack it and commit the pixel buffer.
+	// This maps the surface and makes the idle inhibitor effective.
+	var configureErr error
+	configured := false
+	layerSurf.SetConfigureHandler(func(serial, _, _ uint32) {
+		configured = true
+		if err := layerSurf.AckConfigure(serial); err != nil {
+			configureErr = err
+			return
+		}
+		if err := surface.Attach(pixelBuf, 0, 0); err != nil {
+			configureErr = err
+			return
+		}
+		if err := surface.DamageBuffer(0, 0, 1, 1); err != nil {
+			configureErr = err
+			return
+		}
+		configureErr = surface.Commit()
+	})
+
+	// When the compositor closes the layer surface (e.g. monitor disconnect),
+	// signal that we need to restart the session and recreate the inhibitor.
+	closedCh := make(chan struct{}, 1)
+	layerSurf.SetClosedHandler(func() {
+		select {
+		case closedCh <- struct{}{}:
+		default:
+		}
+	})
+
+	// Initial commit — triggers the compositor to send configure.
+	if err := surface.Commit(); err != nil {
+		return false, fmt.Errorf("surface commit: %w", err)
+	}
+	// Roundtrip 1: compositor sends configure → handler acks + commits with buffer.
+	if err := roundtrip(display); err != nil {
+		return false, fmt.Errorf("roundtrip (configure): %w", err)
+	}
+	if configureErr != nil {
+		return false, fmt.Errorf("configure handler: %w", configureErr)
+	}
+	if !configured {
+		return false, fmt.Errorf("layer surface was not configured by compositor")
+	}
+	// Roundtrip 2: ensures the buffer commit is processed → surface is now mapped.
+	if err := roundtrip(display); err != nil {
+		return false, fmt.Errorf("roundtrip (map): %w", err)
+	}
+
+	// Surface is mapped. Attach the idle inhibitor.
+	inhibitor, err := inhibitManager.CreateInhibitor(surface)
+	if err != nil {
+		return false, fmt.Errorf("create inhibitor: %w", err)
+	}
+	defer inhibitor.Destroy()
+
+	// Roundtrip 3: flush inhibitor creation to the compositor.
+	if err := roundtrip(display); err != nil {
+		return false, fmt.Errorf("roundtrip (inhibitor): %w", err)
+	}
+
+	dispatchErr := make(chan error, 1)
+	go func() {
+		for {
+			if err := display.Context().Dispatch(); err != nil {
+				dispatchErr <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-sigs:
+		return false, nil
+	case err := <-dispatchErr:
+		return false, err
+	case <-closedCh:
+		return true, nil
+	}
+}
+
+// registryBind sends a wl_registry.bind request with correct Wayland string encoding.
+// go-wayland's Registry.Bind uses padded length in the string length field, which
+// breaks smithay-based compositors (niri) that use CStr::from_bytes_with_nul.
+func registryBind(registry *client.Registry, name uint32, iface string, version uint32, id client.Proxy) error {
+	// Correct encoding: length field = len(iface)+1 (including null terminator).
+	// Data = iface bytes + null, padded to 4-byte boundary.
+	actualLen := len(iface) + 1
+	paddedLen := (actualLen + 3) &^ 3
+	msgLen := 8 + 4 + 4 + paddedLen + 4 + 4
+	buf := make([]byte, msgLen)
+	l := 0
+	client.PutUint32(buf[l:], registry.ID())
+	l += 4
+	client.PutUint32(buf[l:], uint32(msgLen<<16))
+	l += 4
+	client.PutUint32(buf[l:], name)
+	l += 4
+	client.PutUint32(buf[l:], uint32(actualLen))
+	l += 4
+	copy(buf[l:], iface)
+	l += paddedLen
+	client.PutUint32(buf[l:], version)
+	l += 4
+	client.PutUint32(buf[l:], id.ID())
+	return registry.Context().WriteMsg(buf, nil)
+}
+
+// cmdCheck runs the full inhibitor setup in the foreground with verbose output.
+// It is intended for diagnosing why the inhibitor stops working after a while.
+func cmdCheck() error {
+	ts := func() string { return time.Now().Format("15:04:05") }
+
+	fmt.Println("Connecting to Wayland display...")
+	display, err := client.Connect("")
+	if err != nil {
+		return fmt.Errorf("wayland connect: %w", err)
+	}
+	defer display.Context().Close()
+	fmt.Println("Connected.")
+
+	registry, err := display.GetRegistry()
+	if err != nil {
+		return fmt.Errorf("get registry: %w", err)
+	}
+
+	type globalEntry struct {
+		name    uint32
+		iface   string
+		version uint32
+	}
+	var globals []globalEntry
+	registry.SetGlobalHandler(func(e client.RegistryGlobalEvent) {
+		globals = append(globals, globalEntry{e.Name, e.Interface, e.Version})
+	})
+
+	if err := roundtrip(display); err != nil {
 		return fmt.Errorf("roundtrip: %w", err)
 	}
+
+	needed := map[string]bool{
+		"wl_compositor":                true,
+		"wl_shm":                       true,
+		"zwp_idle_inhibit_manager_v1":  true,
+		"zwlr_layer_shell_v1":          true,
+	}
+	fmt.Printf("\nAvailable globals (%d):\n", len(globals))
+	for _, g := range globals {
+		marker := ""
+		if needed[g.iface] {
+			marker = "  <-- required"
+		}
+		fmt.Printf("  [%3d] %-45s v%d%s\n", g.name, g.iface, g.version, marker)
+	}
+	fmt.Println()
 
 	var compositor *client.Compositor
 	var shm *client.Shm
@@ -204,15 +471,15 @@ func runDaemon() error {
 		return fmt.Errorf("wl_shm not available")
 	}
 	if inhibitManager == nil {
-		return fmt.Errorf("zwp_idle_inhibit_manager_v1 not available")
+		return fmt.Errorf("zwp_idle_inhibit_manager_v1 not available — compositor does not support idle inhibition")
 	}
 	if layerShell == nil {
 		return fmt.Errorf("zwlr_layer_shell_v1 not available")
 	}
+	fmt.Println("All required protocols available.")
 
-	// Create a 1×1 transparent pixel in shared memory.
-	// The compositor maps this fd, so we keep the file open for the daemon's lifetime.
-	shmFile, err := os.CreateTemp("", "idle-inhibitor-shm-*")
+	// 1×1 transparent pixel in shared memory.
+	shmFile, err := os.CreateTemp("", "idle-check-shm-*")
 	if err != nil {
 		return fmt.Errorf("create shm file: %w", err)
 	}
@@ -224,22 +491,19 @@ func runDaemon() error {
 	if err != nil {
 		return fmt.Errorf("create shm pool: %w", err)
 	}
-	// stride=4 (4 bytes per row), format=ARGB8888 (0x00000000 = transparent black, premultiplied)
 	pixelBuf, err := pool.CreateBuffer(0, 1, 1, 4, uint32(client.ShmFormatArgb8888))
 	if err != nil {
 		return fmt.Errorf("create shm buffer: %w", err)
 	}
+	fmt.Println("Shared-memory buffer created (1×1 transparent pixel).")
 
-	// Create a wl_surface and give it a layer-shell role (BACKGROUND, 1×1, no input).
-	// The compositor only honors zwp_idle_inhibitor_v1 on surfaces that are mapped
-	// (have a role + committed buffer). A bare wl_surface without a role is ignored.
 	surface, err := compositor.CreateSurface()
 	if err != nil {
 		return fmt.Errorf("create surface: %w", err)
 	}
 	defer surface.Destroy()
 
-	layerSurf, err := layerShell.GetLayerSurface(surface, layerBackground, "idle-inhibitor")
+	layerSurf, err := layerShell.GetLayerSurface(surface, layerOverlay, "idle-check")
 	if err != nil {
 		return fmt.Errorf("get layer surface: %w", err)
 	}
@@ -250,12 +514,13 @@ func runDaemon() error {
 		return fmt.Errorf("set keyboard interactivity: %w", err)
 	}
 
-	// When the compositor sends configure, ack it and commit the pixel buffer.
-	// This maps the surface and makes the idle inhibitor effective.
 	var configureErr error
 	configured := false
-	layerSurf.SetConfigureHandler(func(serial, _, _ uint32) {
+	configureCount := 0
+	layerSurf.SetConfigureHandler(func(serial, w, h uint32) {
 		configured = true
+		configureCount++
+		fmt.Printf("[%s] configure #%d  serial=%d  size=%dx%d\n", ts(), configureCount, serial, w, h)
 		if err := layerSurf.AckConfigure(serial); err != nil {
 			configureErr = err
 			return
@@ -271,11 +536,19 @@ func runDaemon() error {
 		configureErr = surface.Commit()
 	})
 
-	// Initial commit — triggers the compositor to send configure.
+	closedCh := make(chan struct{}, 1)
+	layerSurf.SetClosedHandler(func() {
+		fmt.Printf("[%s] LAYER SURFACE CLOSED by compositor\n", ts())
+		select {
+		case closedCh <- struct{}{}:
+		default:
+		}
+	})
+
 	if err := surface.Commit(); err != nil {
-		return fmt.Errorf("surface commit: %w", err)
+		return fmt.Errorf("initial surface commit: %w", err)
 	}
-	// Roundtrip 1: compositor sends configure → handler acks + commits with buffer.
+	fmt.Println("Waiting for compositor configure...")
 	if err := roundtrip(display); err != nil {
 		return fmt.Errorf("roundtrip (configure): %w", err)
 	}
@@ -283,27 +556,27 @@ func runDaemon() error {
 		return fmt.Errorf("configure handler: %w", configureErr)
 	}
 	if !configured {
-		return fmt.Errorf("layer surface was not configured by compositor")
+		return fmt.Errorf("compositor did not send configure — layer surface rejected")
 	}
-	// Roundtrip 2: ensures the buffer commit is processed → surface is now mapped.
 	if err := roundtrip(display); err != nil {
 		return fmt.Errorf("roundtrip (map): %w", err)
 	}
+	fmt.Println("Surface mapped.")
 
-	// Surface is mapped. Attach the idle inhibitor.
 	inhibitor, err := inhibitManager.CreateInhibitor(surface)
 	if err != nil {
 		return fmt.Errorf("create inhibitor: %w", err)
 	}
 	defer inhibitor.Destroy()
 
-	// Roundtrip 3: flush inhibitor creation to the compositor.
 	if err := roundtrip(display); err != nil {
 		return fmt.Errorf("roundtrip (inhibitor): %w", err)
 	}
+	fmt.Printf("[%s] Idle inhibitor ACTIVE. Press Ctrl+C to stop.\n\n", ts())
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigs)
 
 	dispatchErr := make(chan error, 1)
 	go func() {
@@ -315,39 +588,23 @@ func runDaemon() error {
 		}
 	}()
 
-	select {
-	case <-sigs:
-	case err := <-dispatchErr:
-		return err
-	}
-	return nil
-}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	start := time.Now()
 
-// registryBind sends a wl_registry.bind request with correct Wayland string encoding.
-// go-wayland's Registry.Bind uses padded length in the string length field, which
-// breaks smithay-based compositors (niri) that use CStr::from_bytes_with_nul.
-func registryBind(registry *client.Registry, name uint32, iface string, version uint32, id client.Proxy) error {
-	// Correct encoding: length field = len(iface)+1 (including null terminator).
-	// Data = iface bytes + null, padded to 4-byte boundary.
-	actualLen := len(iface) + 1
-	paddedLen := (actualLen + 3) &^ 3
-	msgLen := 8 + 4 + 4 + paddedLen + 4 + 4
-	buf := make([]byte, msgLen)
-	l := 0
-	client.PutUint32(buf[l:], registry.ID())
-	l += 4
-	client.PutUint32(buf[l:], uint32(msgLen<<16))
-	l += 4
-	client.PutUint32(buf[l:], name)
-	l += 4
-	client.PutUint32(buf[l:], uint32(actualLen))
-	l += 4
-	copy(buf[l:], iface)
-	l += paddedLen
-	client.PutUint32(buf[l:], version)
-	l += 4
-	client.PutUint32(buf[l:], id.ID())
-	return registry.Context().WriteMsg(buf, nil)
+	for {
+		select {
+		case <-sigs:
+			fmt.Printf("\n[%s] Stopped. Total uptime: %s\n", ts(), time.Since(start).Round(time.Second))
+			return nil
+		case err := <-dispatchErr:
+			return fmt.Errorf("dispatch error after %s: %w", time.Since(start).Round(time.Second), err)
+		case <-closedCh:
+			return fmt.Errorf("compositor closed layer surface after %s — inhibitor lost", time.Since(start).Round(time.Second))
+		case <-ticker.C:
+			fmt.Printf("[%s] still active (%s)\n", ts(), time.Since(start).Round(time.Second))
+		}
+	}
 }
 
 // roundtrip performs a synchronous Wayland roundtrip, processing all pending events.

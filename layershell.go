@@ -7,7 +7,7 @@ package main
 import "github.com/rajveermalviya/go-wayland/wayland/client"
 
 const (
-	layerBackground           uint32 = 0
+	layerOverlay              uint32 = 3
 	keyboardInteractivityNone uint32 = 0
 )
 
@@ -60,6 +60,7 @@ func (s *LayerShell) GetLayerSurface(surface *client.Surface, layer uint32, name
 type LayerSurface struct {
 	client.BaseProxy
 	onConfigure func(serial, width, height uint32)
+	onClosed    func()
 }
 
 func NewLayerSurface(ctx *client.Context) *LayerSurface {
@@ -70,6 +71,10 @@ func NewLayerSurface(ctx *client.Context) *LayerSurface {
 
 func (s *LayerSurface) SetConfigureHandler(f func(serial, width, height uint32)) {
 	s.onConfigure = f
+}
+
+func (s *LayerSurface) SetClosedHandler(f func()) {
+	s.onClosed = f
 }
 
 // Dispatch handles layer surface events.
@@ -83,7 +88,10 @@ func (s *LayerSurface) Dispatch(opcode uint32, _ int, data []byte) {
 				client.Uint32(data[8:12]),
 			)
 		}
-	// case 1: closed — compositor closed the surface; we'll exit via dispatchErr
+	case 1: // closed — compositor has destroyed the surface on its side
+		if s.onClosed != nil {
+			s.onClosed()
+		}
 	}
 }
 
